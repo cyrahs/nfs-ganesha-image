@@ -102,6 +102,7 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
         /etc/ganesha \
         /usr/local/var/lib/nfs/ganesha \
         /usr/local/var/run/ganesha \
+    && ln -s /proc/mounts /etc/mtab \
     && ldconfig
 
 ENV GANESHA_CONFIG=/etc/ganesha/ganesha.conf
