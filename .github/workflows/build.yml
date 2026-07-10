@@ -1,0 +1,135 @@
+name: Build and publish
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      ganesha_tag:
+        description: Official NFS-Ganesha tag; empty uses the latest stable release
+        required: false
+        type: string
+
+concurrency:
+  group: nfs-ganesha-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/nfs-ganesha-image
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve stable release
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.ganesha_tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG}"
+          if [[ -z "${tag}" ]]; then
+            tag="$(curl -fsSL \
+              -H 'Accept: application/vnd.github+json' \
+              https://api.github.com/repos/nfs-ganesha/nfs-ganesha/releases/latest \
+              | jq -r '.tag_name')"
+          fi
+          if [[ ! "${tag}" =~ ^V[0-9]+\.[0-9]+([.][0-9]+)?$ ]]; then
+            echo "Unexpected release tag: ${tag}" >&2
+            exit 1
+          fi
+          version="${tag#V}"
+          major="${version%%.*}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "major=${major}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.release.outputs.version }}
+            type=raw,value=${{ steps.release.outputs.major }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=NFS-Ganesha
+            org.opencontainers.image.description=Minimal VFS NFS-Ganesha image built from the latest stable upstream release
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            GANESHA_TAG=${{ steps.release.outputs.tag }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Make GHCR package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          endpoint="https://api.github.com/user/packages/container/nfs-ganesha-image"
+          for attempt in {1..12}; do
+            status="$(curl -sS -o /tmp/package.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "${endpoint}")"
+            if [[ "${status}" == "200" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          test "${status}" = "200"
+          visibility="$(jq -r '.visibility' /tmp/package.json)"
+          if [[ "${visibility}" != "public" ]]; then
+            curl --fail-with-body -sS \
+              -X PATCH \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "${endpoint}" \
+              -d '{"visibility":"public"}' \
+              >/tmp/package-update.json
+          fi
+
+      - name: Publish summary
+        run: |
+          {
+            echo '### Published image'
+            echo
+            echo '- Release: `${{ steps.release.outputs.tag }}`'
+            echo '- Image: `${{ env.IMAGE_NAME }}:${{ steps.release.outputs.version }}`'
+            echo '- Digest: `${{ steps.build.outputs.digest }}`'
+          } >> "${GITHUB_STEP_SUMMARY}"
